@@ -8,6 +8,8 @@ from collections import Counter
 import csv
 import pickle
 import os
+import pythoncom
+import queue
 
 # Setup logging
 logging.basicConfig(filename='email_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -42,7 +44,7 @@ try:
 except Exception as e:
     logging.error(f"Error accessing inbox: {str(e)}")
     messagebox.showerror("Error", f"Could not access inbox: {str(e)}")
-    
+
 # Global variables to control the bot
 bot_enabled = False
 last_checked = time.time()
@@ -51,6 +53,7 @@ email_count = 0
 response_times = []
 keyword_counter = Counter()
 reply_count_last_8_hours = []
+email_queue = queue.Queue()  # Queue for email processing
 
 # Function to save settings to a file
 def save_settings():
@@ -88,14 +91,20 @@ def check_inbox():
     for message in messages:
         subject = message.Subject.lower()
         body = message.Body.lower()
-        sender = message.SenderEmailAddress.lower()
         
+        # Retrieve the sender's email address
+        exchange_user = message.Sender.GetExchangeUser ()
+        if exchange_user:
+            sender_email = exchange_user.PrimarySmtpAddress
+        else:
+            sender_email = message.SenderEmailAddress.lower()  # Fallback to the original address
+
         # Check if the sender is blacklisted
-        if sender in blacklist:
+        if sender_email in blacklist:
             continue
         
         recipients = message.Recipients
-        if len(recipients) > 1 or sender == "techhelp.support@cobbk12.org":
+        if len(recipients) > 1 or sender_email == "techhelp.support@cobbk12.org":
             continue
 
         is_distribution_list = False
@@ -123,9 +132,10 @@ def check_inbox():
             message.Unread = False  # Mark the message as read
 
             # Add the email details to the GUI and log the action
-            email_list.insert("", "end", values=(sender, subject, message.ReceivedTime),
+            email_list.insert("", "end", values=(sender_email, subject, message.ReceivedTime),
                               tags=(message.EntryID,))  # Store the EntryID in the tags for easy access
-            logging.info(f"Replied to email from {sender} with subject '{subject}'")
+            print(f"Stored EntryID: {message.EntryID}")
+            logging.info(f"Replied to email from {sender_email} with subject '{subject}'")
 
             # Update statistics
             email_count += 1
@@ -141,7 +151,7 @@ def check_inbox():
                 messagebox.showwarning("Bot Disabled", "The bot has replied more than 3 times in the last 8 hours and has been disabled.")
                 logging.warning("Bot disabled due to exceeding reply limit.")
     last_checked = time.time()
-    
+
 # Function to open the email in Outlook
 def open_email(event):
     selected_item = email_list.selection()  # Get the selected row
@@ -163,18 +173,22 @@ def open_email(event):
         message.Display()  # This opens the email in Outlook
     except Exception as e:
         messagebox.showerror("Error", f"Could not open email: {str(e)}")
-        
+
 # Function to run the bot in a separate thread
 def run_bot():
     global last_checked
-    while True:
-        if bot_enabled:
-            current_time = time.time()
-            if current_time - last_checked >= sync_interval:
-                sync_inbox()  # Sync inbox when timer hits 0 and reset timer
-                last_checked = time.time()
-            update_timer()  # Update the GUI timer label
-        time.sleep(1)  # Sleep 1 second to prevent CPU overload
+    pythoncom.CoInitialize()  # Initialize COM for this thread
+    try:
+        while True:
+            if bot_enabled:
+                current_time = time.time()
+                if current_time - last_checked >= sync_interval:
+                    email_queue.put("sync")  # Signal to check inbox
+                    last_checked = time.time()
+                update_timer()  # Update the GUI timer label
+            time.sleep(1)  # Sleep 1 second to prevent CPU overload
+    finally:
+        pythoncom.CoUninitialize()  # Clean up COM when done
 
 # Function to sync the inbox manually
 def sync_inbox():
