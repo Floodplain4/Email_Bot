@@ -1,0 +1,482 @@
+import win32com.client
+import time
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from threading import Thread
+import logging
+from collections import Counter
+import csv
+import pickle
+import os
+
+# Setup logging
+logging.basicConfig(filename='email_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# Keywords to look for
+keywords = ["help", "stop by", "question"]
+exclude_keywords = []
+blacklist = []  # List of blacklisted email addresses
+
+# Email template
+email_template = (
+    "Hi,<br><br>"
+    "Thank you for reaching out for assistance. To ensure your request is addressed promptly and efficiently, "
+    "please submit a ticket through our official ticketing system.<br><br>"
+    "You can find instructions on how to submit a ticket here: <a href='http://webhelp.cobbk12.org'>webhelp.cobbk12.org</a>.<br><br>"
+    "Thank you for your cooperation!<br><br>"
+    "Best regards,<br>"
+    "Tyler Ledbetter<br>"
+    "Field Technician<br><br>"
+    "This is an automatic reply from a bot. If you need to report issues with this bot, click this link: "
+    "<a href='mailto:tyler.ledbetter@cobbk12.org'>click here</a>"
+)
+
+# Create an instance of the Outlook application
+outlook = win32com.client.Dispatch("Outlook.Application")
+namespace = outlook.GetNamespace("MAPI")
+inbox = namespace.GetDefaultFolder(6)  # 6 refers to the inbox
+
+# Global variables to control the bot
+bot_enabled = False
+last_checked = time.time()
+sync_interval = 300  # 5 minutes
+email_count = 0
+response_times = []
+keyword_counter = Counter()
+reply_count_last_8_hours = []
+
+# Function to save settings to a file
+def save_settings():
+    settings = {
+        "keywords": keywords,
+        "exclude_keywords": exclude_keywords,
+        "email_template": email_template,
+        "blacklist": blacklist,
+        "emails": [email_list.item(row_id)['values'] for row_id in email_list.get_children()]
+    }
+    with open('settings.pkl', 'wb') as f:
+        pickle.dump(settings, f)
+
+# Function to load settings from a file
+def load_settings():
+    global keywords, exclude_keywords, email_template, blacklist
+    try:
+        with open('settings.pkl', 'rb') as f:
+            settings = pickle.load(f)
+            keywords = settings.get("keywords", [])
+            exclude_keywords = settings.get("exclude_keywords", [])
+            email_template = settings.get("email_template", email_template)
+            blacklist = settings.get("blacklist", [])
+            for email in settings.get("emails", []):
+                email_list.insert("", "end", values=email)
+    except FileNotFoundError:
+        pass
+
+# Function to check the inbox and respond to emails
+def check_inbox():
+    global last_checked, email_count, reply_count_last_8_hours
+    messages = inbox.Items
+    messages = messages.Restrict("[UnRead] = True")
+    
+    for message in messages:
+        subject = message.Subject.lower()
+        body = message.Body.lower()
+        sender = message.SenderEmailAddress.lower()
+        
+        # Check if the sender is blacklisted
+        if sender in blacklist:
+            continue
+        
+        recipients = message.Recipients
+        if len(recipients) > 1 or sender == "techhelp.support@cobbk12.org":
+            continue
+
+        is_distribution_list = False
+        for recipient in recipients:
+            try:
+                if recipient.AddressEntryUserType == 1:
+                    is_distribution_list = True
+                    break
+            except AttributeError:
+                continue
+
+        if is_distribution_list:
+            continue
+
+        # Check for exclude keywords
+        if any(keyword in subject or keyword in body for keyword in exclude_keywords):
+            continue
+
+        if any(keyword in subject or keyword in body for keyword in keywords):
+            start_time = time.time()
+            reply = message.Reply()
+            reply.Subject = "Please Submit a Ticket for Assistance"
+            reply.HTMLBody = email_template + reply.HTMLBody
+            reply.Send()
+            message.Unread = False  # Mark the message as read
+
+            # Add the email details to the GUI and log the action
+            email_list.insert("", "end", values=(sender, subject, message.ReceivedTime),
+                              tags=(message.EntryID,))  # Store the EntryID in the tags for easy access
+            logging.info(f"Replied to email from {sender} with subject '{subject}'")
+
+            # Update statistics
+            email_count += 1
+            response_times.append(time.time() - start_time)
+            keyword_counter.update([keyword for keyword in keywords if keyword in subject or keyword in body])
+            
+            # Update reply count and check if it exceeds the limit
+            reply_count_last_8_hours.append(time.time())
+            reply_count_last_8_hours = [t for t in reply_count_last_8_hours if time.time() - t <= 28800]  # Keep only replies within the last 8 hours
+            
+            if len(reply_count_last_8_hours) > 3:
+                disable_bot()
+                messagebox.showwarning("Bot Disabled", "The bot has replied more than 3 times in the last 8 hours and has been disabled.")
+                logging.warning("Bot disabled due to exceeding reply limit.")
+    last_checked = time.time()
+
+# Function to open the email in Outlook
+def open_email(event):
+    selected_item = email_list.selection()  # Get the selected row
+    if not selected_item:
+        return  # No row selected
+
+    # Get the EntryID stored in the tags of the selected row
+    entry_id = email_list.item(selected_item[0])['tags']
+    
+    if not entry_id:  # If no tags exist, return
+        messagebox.showerror("Error", "No EntryID found for this email.")
+        return
+
+    try:
+        # Use the EntryID to retrieve the email from Outlook using GetItemFromID
+        message = namespace.GetItemFromID(entry_id[0])  # Assuming only one tag exists per item
+        
+        # Open the email in Outlook
+        message.Display()  # This opens the email in Outlook
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not open email: {str(e)}")
+        
+# Function to run the bot in a separate thread
+def run_bot():
+    global last_checked
+    while True:
+        if bot_enabled:
+            current_time = time.time()
+            if current_time - last_checked >= sync_interval:
+                sync_inbox()  # Sync inbox when timer hits 0 and reset timer
+                last_checked = time.time()
+            update_timer()  # Update the GUI timer label
+        time.sleep(1)  # Sleep 1 second to prevent CPU overload
+
+# Function to sync the inbox manually
+def sync_inbox():
+    global last_checked
+    check_inbox()
+    last_checked = time.time()
+
+# Function to enable the bot
+def enable_bot():
+    global bot_enabled, last_checked
+    bot_enabled = True
+    last_checked = time.time()
+    update_timer()  # Start the timer update when the bot is enabled
+
+# Function to disable the bot
+def disable_bot():
+    global bot_enabled
+    bot_enabled = False
+    timer_label.config(text="Bot is disabled")  # Set to disabled immediately
+
+# Function to update the countdown timer in the GUI
+def update_timer():
+    global last_checked, sync_interval
+    if bot_enabled:
+        time_left = sync_interval - (time.time() - last_checked)
+        if time_left <= 0:
+            sync_inbox()  # Sync inbox when timer hits 0 and reset timer
+            last_checked = time.time()
+            time_left = sync_interval  # Reset timer after syncing inbox
+
+        # Update the timer label in the GUI using root.after
+        timer_label.config(text=f"Time to Sync: {int(time_left)} seconds")
+        
+        # Schedule the next timer update in 1000ms (1 second)
+        root.after(1000, update_timer)
+    else:
+        timer_label.config(text="Bot is disabled")
+
+# Function to customize keywords through a GUI window
+def customize_keywords():
+    def add_keyword():
+        new_keyword = keyword_entry.get().strip().lower()
+        if new_keyword and new_keyword not in keywords:
+            keywords.append(new_keyword)
+            keyword_list.insert("", "end", values=(new_keyword,))
+            save_settings()
+
+    def remove_keyword():
+        selected_item = keyword_list.selection()[0]
+        keyword_list.delete(selected_item)
+        keywords.remove(keyword_list.item(selected_item)['values'][0])
+        save_settings()
+
+    customize_window = tk.Toplevel(root)
+    customize_window.title("Customize Keywords")
+
+    ttk.Label(customize_window, text="Keywords:").grid(row=0, column=0, columnspan=2)
+
+    keyword_list = ttk.Treeview(customize_window, columns=("Keyword"), show="headings")
+    keyword_list.heading("Keyword", text="Keyword")
+    keyword_list.grid(row=1, column=0, columnspan=2)
+
+    for kw in keywords:
+        keyword_list.insert("", "end", values=(kw,))
+    
+    ttk.Label(customize_window, text="New Keyword:").grid(row=2, column=0)
+    keyword_entry = ttk.Entry(customize_window)
+    keyword_entry.grid(row=2, column=1)
+
+    add_button = ttk.Button(customize_window, text="Add", command=add_keyword)
+    add_button.grid(row=3, column=0)
+
+    remove_button = ttk.Button(customize_window, text="Remove", command=remove_keyword)
+    remove_button.grid(row=3, column=1)
+
+# Function to customize exclude keywords through a GUI window
+def customize_exclude_keywords():
+    def add_exclude_keyword():
+        new_keyword = exclude_keyword_entry.get().strip().lower()
+        if new_keyword and new_keyword not in exclude_keywords:
+            exclude_keywords.append(new_keyword)
+            exclude_keyword_list.insert("", "end", values=(new_keyword,))
+            exclude_keyword_entry.delete(0, tk.END)  # Clear the entry after adding
+            save_settings()
+
+    def remove_exclude_keyword():
+        selected_item = exclude_keyword_list.selection()[0]
+        keyword_to_remove = exclude_keyword_list.item(selected_item)['values'][0]
+        exclude_keyword_list.delete(selected_item)
+        exclude_keywords.remove(keyword_to_remove)
+        save_settings()
+
+    exclude_window = tk.Toplevel(root)
+    exclude_window.title("Customize Exclude Keywords")
+
+    ttk.Label(exclude_window, text="Exclude Keywords:").grid(row=0, column=0, columnspan=2)
+
+    exclude_keyword_list = ttk.Treeview(exclude_window, columns=("Keyword"), show="headings")
+    exclude_keyword_list.heading("Keyword", text="Keyword")
+    exclude_keyword_list.grid(row=1, column=0, columnspan=2)
+
+    for kw in exclude_keywords:
+        exclude_keyword_list.insert("", "end", values=(kw,))
+
+    ttk.Label(exclude_window, text="New Keyword:").grid(row=2, column=0)
+    exclude_keyword_entry = ttk.Entry(exclude_window)
+    exclude_keyword_entry.grid(row=2, column=1)
+
+    add_button = ttk.Button(exclude_window, text="Add", command=add_exclude_keyword)
+    add_button.grid(row=3, column=0)
+
+    remove_button = ttk.Button(exclude_window, text="Remove", command=remove_exclude_keyword)
+    remove_button.grid(row=3, column=1)
+
+# Function to adjust email template through a GUI window
+def adjust_template():
+    def save_template():
+        global email_template
+        email_template = template_text.get("1.0", tk.END).strip()
+        save_settings()
+        template_window.destroy()
+
+    template_window = tk.Toplevel(root)
+    template_window.title("Adjust Email Template")
+
+    ttk.Label(template_window, text="Email Template:").grid(row=0, column=0)
+
+    template_text = tk.Text(template_window, width=80, height=20)
+    template_text.grid(row=1, column=0)
+    
+    template_text.insert(tk.END, email_template)
+
+    save_button = ttk.Button(template_window, text="Save", command=save_template)
+    save_button.grid(row=2, column=0)
+
+# Function to show statistics dashboard through a GUI window
+def show_statistics():
+    stats_window = tk.Toplevel(root)
+    stats_window.title("Statistics Dashboard")
+
+    ttk.Label(stats_window, text="Statistics:").grid(row=0, column=0, columnspan=2)
+
+    ttk.Label(stats_window, text="Emails Processed:").grid(row=1, column=0)
+    ttk.Label(stats_window, text=str(email_count)).grid(row=1, column=1)
+
+    ttk.Label(stats_window, text="Average Response Time:").grid(row=2, column=0)
+    avg_response_time = sum(response_times) / len(response_times) if response_times else 0
+    ttk.Label(stats_window, text=f"{avg_response_time:.2f} seconds").grid(row=2, column=1)
+
+    ttk.Label(stats_window, text="Common Keywords:").grid(row=3, column=0)
+    common_keywords = ", ".join([f"{kw} ({count})" for kw, count in keyword_counter.most_common()])
+    ttk.Label(stats_window, text=common_keywords).grid(row=3, column=1)
+
+# Function to export email data to CSV
+def export_to_csv():
+    file_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+    if file_path:
+        with open(file_path, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(["Sender", "Subject", "Timestamp"])
+            for row_id in email_list.get_children():
+                row = email_list.item(row_id)['values']
+                writer.writerow(row)
+        messagebox.showinfo("Export Successful", f"Emails exported to {file_path}")
+
+# Function to clear the email list in the GUI
+def clear_window():
+    for row_id in email_list.get_children():
+        email_list.delete(row_id)
+    save_settings()
+
+# Function to open the log file
+def check_log():
+    os.startfile('email_bot.log')
+
+# Function to manage the blacklist
+def manage_blacklist():
+    def add_to_blacklist():
+        email = blacklist_entry.get().strip().lower()
+        if email and email not in blacklist:
+            blacklist.append(email)
+            blacklist_list.insert("", "end", values=(email,))
+            blacklist_entry.delete(0, tk.END)  # Clear the entry
+            save_settings()
+
+    def remove_from_blacklist():
+        selected_item = blacklist_list.selection()[0]
+        email_to_remove = blacklist_list.item(selected_item)['values'][0]
+        blacklist_list.delete(selected_item)
+        blacklist.remove(email_to_remove)
+        save_settings()
+
+    blacklist_window = tk.Toplevel(root)
+    blacklist_window.title("Manage Blacklist")
+
+    ttk.Label(blacklist_window, text="Blacklisted Emails:").grid(row=0, column=0, columnspan=2)
+
+    blacklist_list = ttk.Treeview(blacklist_window, columns=("Email"), show="headings")
+    blacklist_list.heading("Email", text="Email")
+    blacklist_list.grid(row=1, column=0, columnspan=2)
+
+    for email in blacklist:
+        blacklist_list.insert("", "end", values=(email,))
+    
+    ttk.Label(blacklist_window, text="New Email:").grid(row=2, column=0)
+    blacklist_entry = ttk.Entry(blacklist_window)
+    blacklist_entry.grid(row=2, column=1)
+
+    add_button = ttk.Button(blacklist_window, text="Add", command=add_to_blacklist)
+    add_button.grid(row=3, column=0)
+
+    remove_button = ttk.Button(blacklist_window, text="Remove", command=remove_from_blacklist)
+    remove_button.grid(row=3, column=1)
+
+# Create the GUI
+root = tk.Tk()
+root.title("Email Bot")
+
+# Apply a theme
+style = ttk.Style()
+style.theme_use('clam')
+
+# Customize styles
+style.configure('TButton', font=('Helvetica', 12, 'bold'), foreground='blue')
+style.configure('TLabel', font=('Helvetica', 10), foreground='green')
+style.configure('Treeview.Heading', font=('Helvetica', 12, 'bold'))
+
+# Main frame to hold everything
+frame = ttk.Frame(root, padding="10")
+frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+# Email list Treeview (main list of emails)
+email_list = ttk.Treeview(frame, columns=("Sender", "Subject", "Timestamp"), show="headings")
+email_list.heading("Sender", text="Sender")
+email_list.heading("Subject", text="Subject")
+email_list.heading("Timestamp", text="Timestamp")
+email_list.grid(row=0, column=0, columnspan=5, pady=5)
+
+# Bind the double-click event on the email list to open the email
+email_list.bind("<Double-1>", open_email)  # Double-click to open the email in Outlook
+
+# Buttons layout frame
+button_frame = ttk.Frame(frame)
+button_frame.grid(row=1, column=0, columnspan=5, pady=5, sticky="ew")
+
+# Top row buttons: Enable, Template, Sync Inbox, Customize, Exclude
+enable_button = ttk.Button(button_frame, text="Enable", command=enable_bot)
+enable_button.grid(row=0, column=0, padx=2, pady=2)
+
+template_button = ttk.Button(button_frame, text="Template", command=adjust_template)
+template_button.grid(row=0, column=1, padx=2, pady=2)
+
+sync_button = ttk.Button(button_frame, text="Sync Inbox", command=sync_inbox)
+sync_button.grid(row=0, column=2, padx=2, pady=2)
+
+customize_button = ttk.Button(button_frame, text="Customize", command=customize_keywords)
+customize_button.grid(row=0, column=3, padx=2, pady=2)
+
+exclude_button = ttk.Button(button_frame, text="Exclude", command=customize_exclude_keywords)
+exclude_button.grid(row=0, column=4, padx=2, pady=2)
+
+# Bottom row buttons: Disable, Clear Window, Statistics, Blacklist, Check Log
+bottom_button_frame = ttk.Frame(frame)
+bottom_button_frame.grid(row=2, column=0, columnspan=5, pady=5, sticky="ew")
+
+disable_button = ttk.Button(bottom_button_frame, text="Disable", command=disable_bot)
+disable_button.grid(row=0, column=0, padx=2, pady=2)
+
+clear_button = ttk.Button(bottom_button_frame, text="Clear Window", command=clear_window)
+clear_button.grid(row=0, column=1, padx=2, pady=2)
+
+stats_button = ttk.Button(bottom_button_frame, text="Statistics", command=show_statistics)
+stats_button.grid(row=0, column=2, padx=2, pady=2)
+
+blacklist_button = ttk.Button(bottom_button_frame, text="Blacklist", command=manage_blacklist)
+blacklist_button.grid(row=0, column=3, padx=2, pady=2)
+
+log_button = ttk.Button(bottom_button_frame, text="Check Log", command=check_log)
+log_button.grid(row=0, column=4, padx=2, pady=2)
+
+# Small Export to CSV button (with icon)
+export_button = ttk.Button(frame, text="Export", command=export_to_csv)
+export_button.grid(row=3, column=0, padx=5, pady=5, sticky="w")
+
+# **Updated Timer Placement**
+# Create a separate row for the timer and place it directly under Statistics button (centered)
+timer_frame = ttk.Frame(frame, relief="solid", borderwidth=2, padding="10")
+timer_frame.grid(row=3, column=2, pady=5)  # Centered under Statistics button
+
+# Timer label
+timer_label = ttk.Label(timer_frame, text="Bot is disabled", style='TLabel')
+timer_label.pack(padx=10, pady=5)
+
+# Resize behavior for grid columns (makes everything scale properly)
+frame.grid_columnconfigure(0, weight=1)
+frame.grid_columnconfigure(1, weight=1)
+frame.grid_columnconfigure(2, weight=1)
+frame.grid_columnconfigure(3, weight=1)
+frame.grid_columnconfigure(4, weight=1)
+
+# Load settings when the program starts
+load_settings()
+
+# Save settings when the program closes
+root.protocol("WM_DELETE_WINDOW", lambda: (save_settings(), root.destroy()))
+
+# Start the bot thread
+bot_thread = Thread(target=run_bot)
+bot_thread.daemon = True
+bot_thread.start()
+
+root.mainloop()
