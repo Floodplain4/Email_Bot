@@ -132,8 +132,7 @@ def check_inbox():
             message.Unread = False  # Mark the message as read
 
             # Add the email details to the GUI and log the action
-            email_list.insert("", "end", values=(sender_email, subject, message.ReceivedTime),
-                              tags=(message.EntryID,))  # Store the EntryID in the tags for easy access
+            email_list.insert("", "end", values=(sender_email, subject, message.ReceivedTime, message.EntryID)) 
             print(f"Stored EntryID: {message.EntryID}")
             logging.info(f"Replied to email from {sender_email} with subject '{subject}'")
 
@@ -152,22 +151,21 @@ def check_inbox():
                 logging.warning("Bot disabled due to exceeding reply limit.")
     last_checked = time.time()
 
-# Function to open the email in Outlook
 def open_email(event):
     selected_item = email_list.selection()  # Get the selected row
     if not selected_item:
         return  # No row selected
 
-    # Get the EntryID stored in the tags of the selected row
-    entry_id = email_list.item(selected_item[0])['tags']
+    # Get the EntryID stored in the values of the selected row
+    entry_id = email_list.item(selected_item[0])['values'][3]  # Assuming EntryID is the 4th value
     
-    if not entry_id:  # If no tags exist, return
+    if not entry_id:  # If no EntryID exists, return
         messagebox.showerror("Error", "No EntryID found for this email.")
         return
 
     try:
         # Use the EntryID to retrieve the email from Outlook using GetItemFromID
-        message = namespace.GetItemFromID(entry_id[0])  # Assuming only one tag exists per item
+        message = namespace.GetItemFromID(entry_id)  # No need for indexing since entry_id is a single value
         
         # Open the email in Outlook
         message.Display()  # This opens the email in Outlook
