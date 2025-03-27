@@ -34,8 +34,15 @@ email_template = (
 # Create an instance of the Outlook application
 outlook = win32com.client.Dispatch("Outlook.Application")
 namespace = outlook.GetNamespace("MAPI")
-inbox = namespace.GetDefaultFolder(6)  # 6 refers to the inbox
 
+try:
+    inbox = namespace.GetDefaultFolder(6)  # 6 refers to the inbox
+    if inbox is None:
+        raise Exception("Inbox could not be accessed.")
+except Exception as e:
+    logging.error(f"Error accessing inbox: {str(e)}")
+    messagebox.showerror("Error", f"Could not access inbox: {str(e)}")
+    
 # Global variables to control the bot
 bot_enabled = False
 last_checked = time.time()
@@ -134,7 +141,7 @@ def check_inbox():
                 messagebox.showwarning("Bot Disabled", "The bot has replied more than 3 times in the last 8 hours and has been disabled.")
                 logging.warning("Bot disabled due to exceeding reply limit.")
     last_checked = time.time()
-
+    
 # Function to open the email in Outlook
 def open_email(event):
     selected_item = email_list.selection()  # Get the selected row
